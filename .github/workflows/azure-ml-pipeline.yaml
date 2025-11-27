@@ -1,0 +1,147 @@
+name: Azure ML Pipeline - Animals Classification
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  WORKSPACE: ${{ secrets.AZURE_WORKSPACE }}
+  LOCATION: ${{ secrets.AZURE_LOCATION }}
+
+jobs:
+  azure-pipeline:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Azure -- Create compute
+        shell: bash
+        run: |
+          az extension add --name ml -y --upgrade
+          az configure --defaults group=$GROUP workspace=$WORKSPACE
+          if az ml compute show --name cli-created-machine --resource-group $GROUP --workspace-name $WORKSPACE 2>/dev/null; then
+            echo "Compute already exists, skipping creation"
+          else
+            echo "Compute doesn't exist, creating..."
+            az ml compute create --file ./environment/compute.yaml
+          fi
+        continue-on-error: true
+
+
+      - name: Azure -- Start Compute
+        shell: bash
+        run: |
+          az extension add --name ml -y --upgrade
+          az configure --defaults group=$GROUP workspace=$WORKSPACE location=$LOCATION
+          az ml compute start --name cli-created-machine
+        continue-on-error: true
+
+      - name: Azure -- Environment Setup
+        shell: bash
+        run: |
+          az extension add --name ml -y --upgrade
+          az configure --defaults group=$GROUP workspace=$WORKSPACE location=$LOCATION
+          az ml environment create --file ./environment/preprocessing.yaml
+          az ml environment create --file ./environment/training.yaml
+
+      - name: Azure -- Pipeline Run
+        shell: bash
+        run: |
+          az extension add --name ml -y --upgrade
+          az configure --defaults group=$GROUP workspace=$WORKSPACE location=$LOCATION
+          az ml job create --file ./pipelines/animals-classification.yaml \
+            --stream \
+            --set name=animals-classification-${{ github.sha }}-${{ github.run_id }}
+
+      - name: Cleanup Compute
+        shell: bash
+        run: |
+          az extension add --name ml -y --upgrade
+          az configure --defaults group=$GROUP workspace=$WORKSPACE location=$LOCATION
+          az ml compute stop --name cli-created-machine
+        continue-on-error: true
+
+  download:
+    needs: azure-pipeline
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Azure -- Download Model
+        shell: bash
+        run: |
+          az extension add --name ml -y --upgrade
+          az configure --defaults group=$GROUP workspace=$WORKSPACE
+          
+          # Download model directly from job outputs (since registration is skipped)
+          az ml job download --name animals-classification-${{ github.sha }}-${{ github.run_id }} \
+            --download-path ./model \
+            --output-name model
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: ./model
+
+  deploy:
+    needs: download
+    runs-on: self-hosted
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: ./inference/model  
+
+      - name: Docker Meta Information
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/VandemeulebrouckeRoan/mlops-animals-api 
+          tags: |
+            type=ref,event=branch
+            type=sha
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./inference
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Deploy to Kubernetes
+        shell: powershell
+        run: |
+          kubectl apply -f ./kubernetes/deployment.yaml
+          kubectl apply -f ./kubernetes/service.yaml
+          kubectl set image deployment/animals-api animals-api=ghcr.io/VandemeulebrouckeRoan/mlops-animals-api:main
